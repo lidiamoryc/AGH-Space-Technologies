@@ -1,4 +1,4 @@
-This repository will be a place to keep resources related to the 'Remote Sensing and Image Analysis in Space Tech'
+This repository will be a place to keep resources related to the 'Remote Sensing and Image Analysis in Space Tech' subject
 
 The README will be updated in the near future
 
