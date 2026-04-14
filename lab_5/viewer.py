@@ -36,7 +36,7 @@ except ImportError:
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # Default search directory (relative to this script)
-DATA_DIR = Path(__file__).parent / "data" / "images"
+DATA_DIR = Path("G:\Mój dysk\mggp_naloty\Obrazy lotnicze")
 
 # Fallback RGB band indices (0-based) when the header has no default_bands
 FALLBACK_RGB = (30, 20, 10)
@@ -88,14 +88,15 @@ def load_image(hdr_path: Path):
     return envi.open(str(hdr_path))
 
 
-def read_rgb(img, r: int, g: int, b: int, ignore_value: float | None) -> np.ndarray:
+def read_rgb(img, r: int, g: int, b: int, ignore_value: float | None, decimate: int = 10) -> np.ndarray:
     """
     Read three bands and return a float32 RGB array (values 0–1) for display.
+    Spatially decimated by `decimate` factor for speed — only every Nth row/col is read.
     No-data pixels and negative values are masked before the stretch.
     Applies a per-channel 2–98 % percentile stretch.
     """
-    # shape: (lines, samples, 3) — reads only 3 bands from disk
-    rgb = img.read_bands([r, g, b]).astype(np.float32)
+    full = img.read_bands([r, g, b]).astype(np.float32)
+    rgb = full[::decimate, ::decimate, :]   # decimate spatially
 
     if ignore_value is not None:
         rgb[rgb >= ignore_value] = np.nan
@@ -108,19 +109,30 @@ def read_rgb(img, r: int, g: int, b: int, ignore_value: float | None) -> np.ndar
 
     return np.nan_to_num(rgb, nan=0.0)
 
+# def read_spectrum(img, row: int, col: int, ignore_value: float | None) -> np.ndarray:
+#     """
+#     Read the full spectrum (all bands) for a single pixel.
+#     BSQ layout makes this efficient: one seek per band.
+#     Bad / no-data values are replaced with NaN so the plot shows gaps.
+#     """
+#     spec = img.read_pixel(row, col).astype(np.float64)
+#     if ignore_value is not None:
+#         spec[spec >= ignore_value] = np.nan
+#     spec[spec < 0] = np.nan
+#     return spec
 
 def read_spectrum(img, row: int, col: int, ignore_value: float | None) -> np.ndarray:
     """
-    Read the full spectrum (all bands) for a single pixel.
-    BSQ layout makes this efficient: one seek per band.
-    Bad / no-data values are replaced with NaN so the plot shows gaps.
+    Read the full spectrum (all bands) for a single pixel via read_subimage.
+    Faster than read_pixel on BSQ: one contiguous read per band instead of
+    one single-value seek per band.
     """
-    spec = img.read_pixel(row, col).astype(np.float64)
+    patch = img.read_subimage([row], [col])   # shape: (1, 1, nbands)
+    spec = patch[0, 0, :].astype(np.float64)
     if ignore_value is not None:
         spec[spec >= ignore_value] = np.nan
     spec[spec < 0] = np.nan
     return spec
-
 
 # ── Application ───────────────────────────────────────────────────────────────
 
@@ -132,6 +144,7 @@ class HyperspectralViewer:
 
         # state
         self.img = None
+        self.decimate: int = 10
         self.wavelengths: np.ndarray | None = None
         self.ignore_value: float | None = None
         self.rgb_display: np.ndarray | None = None   # float32 (lines, samples, 3)
@@ -237,10 +250,10 @@ class HyperspectralViewer:
             self.wavelengths = parse_wavelengths(meta)
             self.ignore_value = get_ignore_value(meta)
             r, g, b = get_rgb_bands(meta)
-            self.rgb_display = read_rgb(self.img, r, g, b, self.ignore_value)
+            self.rgb_display = read_rgb(self.img, r, g, b, self.ignore_value, self.decimate)
             self.spectrum = None
             self.pixel_pos = None
-            self._refresh_plots()
+            self._refresh_plots(update_rgb=True) 
             self.status_var.set(
                 f"{hdr_path.name}  |  "
                 f"{self.img.nrows} lines × {self.img.ncols} samples × "
@@ -253,20 +266,25 @@ class HyperspectralViewer:
 
     # ── Plotting ──────────────────────────────────────────────────────────────
 
-    def _refresh_plots(self):
-        # ── left: RGB image ──
-        self.ax_rgb.clear()
-        if self.rgb_display is not None:
-            self.ax_rgb.imshow(
-                self.rgb_display, interpolation="bilinear", aspect="auto"
-            )
-            if self.pixel_pos:
-                row, col = self.pixel_pos
-                self.ax_rgb.plot(
-                    col, row, "r+", markersize=14, markeredgewidth=2.5
+    def _refresh_plots(self, update_rgb: bool = True):
+        if update_rgb:
+            self.ax_rgb.clear()
+            if self.rgb_display is not None:
+                self.ax_rgb.imshow(
+                    self.rgb_display, interpolation="bilinear", aspect="auto"
                 )
-        self.ax_rgb.set_title("RGB preview — click a pixel to inspect")
-        self.ax_rgb.axis("off")
+            self.ax_rgb.set_title("RGB preview — click a pixel to inspect")
+            self.ax_rgb.axis("off")
+
+        # always redraw marker
+        for artist in self.ax_rgb.lines:
+            artist.remove()
+        if self.pixel_pos:
+            row, col = self.pixel_pos
+            self.ax_rgb.plot(
+                col / self.decimate, row / self.decimate,
+                "r+", markersize=14, markeredgewidth=2.5
+            )
 
         # ── right: spectral signature ──
         self.ax_spec.clear()
@@ -295,20 +313,22 @@ class HyperspectralViewer:
 
         self.fig.tight_layout(pad=2.5)
         self.canvas.draw()
-
     # ── Mouse click handler ───────────────────────────────────────────────────
 
     def _on_click(self, event):
         if event.inaxes is not self.ax_rgb or self.img is None:
             return
-        col = int(round(event.xdata))
-        row = int(round(event.ydata))
-        if not (0 <= row < self.img.nrows and 0 <= col < self.img.ncols):
-            return
+        # event coords are in decimated-image space — map back to full resolution
+        col = int(round(event.xdata)) * self.decimate
+        row = int(round(event.ydata)) * self.decimate
+
+        # clamp to valid range
+        row = min(row, self.img.nrows - 1)
+        col = min(col, self.img.ncols - 1)
 
         self.pixel_pos = (row, col)
         self.spectrum = read_spectrum(self.img, row, col, self.ignore_value)
-        self._refresh_plots()
+        self._refresh_plots(update_rgb=False)
         self.status_var.set(
             f"Pixel ({row}, {col})  |  "
             "Use 'Export spectrum to CSV…' to save."
