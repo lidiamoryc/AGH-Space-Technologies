@@ -1,3 +1,0 @@
-pystac[validation]>=1.10
-jupyterlab>=4.0
-jsonschema>=4.0
